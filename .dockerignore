@@ -1,0 +1,11 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore
+*.mp3
+*.wav
+temp_query.wav
+onlyRules_*.txt
+working*.txt

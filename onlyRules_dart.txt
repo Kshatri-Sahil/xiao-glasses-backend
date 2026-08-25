@@ -1,0 +1,350 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+import 'dart:ui' as ui; 
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
+import 'package:record/record.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:flutter_mjpeg/flutter_mjpeg.dart';
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'XIAO Analytics Glasses',
+      theme: ThemeData.dark(),
+      home: const StreamScreen(),
+    );
+  }
+}
+
+class StreamScreen extends StatefulWidget {
+  const StreamScreen({super.key});
+
+  @override
+  State<StreamScreen> createState() => _StreamScreenState();
+}
+
+class _StreamScreenState extends State<StreamScreen> {
+  // Global View Layout Keys
+  final GlobalKey _videoWidgetKey = new GlobalKey();
+
+  // Network State Management
+  bool _isStreaming = false;
+  bool _isAnalyzingFrame = false;
+  String _debugStatusText = "System Offline. Connect to pipeline.";
+  
+  // Feature 1: Face Tracking Overlay States
+  String _detectedPlayerName = "";
+  Map<String, dynamic> _playerStats = {};
+  Rect? _targetTrackingBox;
+  Timer? _analysisTimer;
+
+  // Feature 2: Voice RAG Rules Assistant States
+  final AudioRecorder _audioRecorder = AudioRecorder();
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  bool _isRecordingVoice = false;
+  bool _isWaitingForReferee = false;
+
+  // --- FEATURE 1 LIVE PIPELINE CAPTURE ---
+  void _startFaceRecognitionLoop() {
+    _analysisTimer = Timer.periodic(const Duration(milliseconds: 600), (timer) async {
+      if (_isAnalyzingFrame || !_isStreaming) return;
+
+      if (mounted) {
+        setState(() {
+          _isAnalyzingFrame = true;
+          _debugStatusText = "Extracting frame from live video widget...";
+        });
+      }
+
+      try {
+        final boundary = _videoWidgetKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+        if (boundary == null) throw Exception("Video view context container not active.");
+
+        // Downscale frame cleanly to 50% scale to optimize local network transmission speeds
+        ui.Image image = await boundary.toImage(pixelRatio: 0.5);
+        ByteData? byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+        if (byteData == null) throw Exception("Failed to convert image matrix layout.");
+        Uint8List frameBytes = byteData.buffer.asUint8List();
+
+        await _queryFaceRecognitionBackend(frameBytes);
+      } catch (e) {
+        print("Frame grab warning: $e");
+      } finally {
+        if (mounted) {
+          setState(() => _isAnalyzingFrame = false);
+        }
+      }
+    });
+  }
+
+  Future<void> _queryFaceRecognitionBackend(Uint8List imageBytes) async {
+    try {
+      final backendUrl = Uri.parse("http://192.168.1.5:5000/api/recognize");
+      final response = await http.post(
+        backendUrl,
+        headers: {"Content-Type": "image/png"},
+        body: imageBytes,
+      ).timeout(const Duration(seconds: 4));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data["face_found"] == true) {
+          setState(() {
+            _detectedPlayerName = data["name"];
+            _playerStats = data["stats"];
+            
+            final box = data["box"];
+            _targetTrackingBox = Rect.fromLTWH(
+              box["left"].toDouble(),
+              box["top"].toDouble(),
+              box["width"].toDouble(),
+              box["height"].toDouble(),
+            );
+            _debugStatusText = "Tracking Player: $_detectedPlayerName";
+          });
+        } else {
+          setState(() {
+            _targetTrackingBox = null;
+            _detectedPlayerName = "";
+            _playerStats = {};
+            _debugStatusText = "Scanning environment feed...";
+          });
+        }
+      }
+    } catch (e) {
+      print("Backend processing error details: ${e.toString()}");
+    }
+  }
+
+  // --- FEATURE 2 VOICE RULES PIPELINE (BRIDGED VIA PHONE MIC) ---
+  Future<void> _toggleVoiceRuleQuery() async {
+    if (_isRecordingVoice) {
+      // --- STOP RECORDING AND TRANSMIT DATA ---
+      final path = await _audioRecorder.stop();
+      setState(() {
+        _isRecordingVoice = false;
+        _isWaitingForReferee = true;
+        _debugStatusText = "Sending query to local RAG server...";
+      });
+
+      if (path == null) {
+        setState(() => _isWaitingForReferee = false);
+        return;
+      }
+
+      try {
+        final file = File(path);
+        final rawAudioBytes = await file.readAsBytes();
+
+        final url = Uri.parse("http://192.168.1.5:5000/api/ask_rules");
+        final response = await http.post(
+          url,
+          headers: {"Content-Type": "application/octet-stream"},
+          body: rawAudioBytes,
+        );
+
+        if (response.statusCode == 200) {
+          final tempDir = await getTemporaryDirectory();
+          final responseFile = File('${tempDir.path}/ref_response.wav');
+          await responseFile.writeAsBytes(response.bodyBytes);
+
+          setState(() {
+            _isWaitingForReferee = false;
+            _debugStatusText = "Playing rule explanation...";
+          });
+
+          await _audioPlayer.setFilePath(responseFile.path);
+          await _audioPlayer.play();
+        } else {
+          throw Exception("Server Error Code: ${response.statusCode}");
+        }
+      } catch (e) {
+        setState(() {
+          _isWaitingForReferee = false;
+          _debugStatusText = "Query Failed: ${e.toString()}";
+        });
+      }
+    } else {
+      // --- START RECORDING FROM DEVICE MIC ---
+      if (await _audioRecorder.hasPermission()) {
+        final tempDir = await getTemporaryDirectory();
+        final recordPath = '${tempDir.path}/query.wav';
+
+        await _audioRecorder.start(
+          const RecordConfig(encoder: AudioEncoder.pcm16bits, sampleRate: 16000, numChannels: 1),
+          path: recordPath,
+        );
+
+        setState(() {
+          _isRecordingVoice = true;
+          _debugStatusText = "Listening... Ask your question then click stop.";
+        });
+      } else {
+        setState(() => _debugStatusText = "Microphone permission denied.");
+      }
+    }
+  }
+
+  void _toggleSystemConnection() {
+    setState(() {
+      _isStreaming = !_isStreaming;
+      if (_isStreaming) {
+        _debugStatusText = "Connected to system pipeline.";
+        _startFaceRecognitionLoop();
+      } else {
+        _analysisTimer?.cancel();
+        _targetTrackingBox = null;
+        _detectedPlayerName = "";
+        _playerStats = {};
+        _debugStatusText = "Glasses Offline.";
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _analysisTimer?.cancel();
+    _audioRecorder.dispose();
+    _audioPlayer.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("XIAO Sports Analytics Glasses")),
+      body: Column(
+        children: [
+          // Connection Toggle Button
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: ElevatedButton(
+              onPressed: _toggleSystemConnection,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _isStreaming ? Colors.red : Colors.green,
+                minimumSize: const Size.fromHeight(50),
+              ),
+              child: Text(_isStreaming ? "Disconnect Pipeline" : "Connect Smart Glasses"),
+            ),
+          ),
+
+          // Integrated Feature 2 Voice Action Button
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 4.0),
+            child: ElevatedButton.icon(
+              onPressed: (_isStreaming && !_isWaitingForReferee) ? _toggleVoiceRuleQuery : null,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _isRecordingVoice ? Colors.orange : Colors.blueGrey,
+                minimumSize: const Size.fromHeight(50),
+              ),
+              icon: Icon(_isRecordingVoice ? Icons.stop : Icons.mic),
+              label: Text(_isRecordingVoice 
+                  ? "Stop & Ask Referee" 
+                  : _isWaitingForReferee 
+                      ? "Ref processing database query..." 
+                      : "Hold to Ask Rule Assistant"),
+            ),
+          ),
+
+          // Core Processing View Frame
+          Expanded(
+            child: Center(
+              child: RepaintBoundary(
+                key: _videoWidgetKey,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    // Render the live HTTP video stream directly when connected
+// === WITH THIS UPDATED MJPEG WIDGET ===
+                    _isStreaming
+                        ? Mjpeg(
+                            isLive: _isStreaming,
+                            stream: "http://192.168.1.21:82/stream",
+                            width: 320,
+                            height: 240,
+                            fit: BoxFit.cover,
+                            error: (context, error, stackTrace) {
+                              return Container(
+                                width: 320,
+                                height: 240,
+                                color: Colors.black54,
+                                child: const Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(Icons.broken_image, size: 48, color: Colors.white30),
+                                    SizedBox(height: 8),
+                                    Text("Failed to load camera MJPEG stream", style: TextStyle(color: Colors.white30, fontSize: 12)),
+                                  ],
+                                ),
+                              );
+                            },
+                          )
+                        : Container(
+                            width: 320,
+                            height: 240,
+                            color: Colors.black54,
+                            child: const Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.camera_alt, size: 48, color: Colors.white30),
+                                SizedBox(height: 8),
+                                Text("Pipeline Inactive", style: TextStyle(color: Colors.white30, fontSize: 12)),
+                              ],
+                            ),
+                          ),
+                                      
+                    // Live UI bounding target rectangle overlay box
+                    if (_targetTrackingBox != null)
+                      Positioned(
+                        left: _targetTrackingBox!.left,
+                        top: _targetTrackingBox!.top,
+                        width: _targetTrackingBox!.width,
+                        height: _targetTrackingBox!.height,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.red, width: 3.0),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
+          // Analytics Interface Board
+          Container(
+            padding: const EdgeInsets.all(16.0),
+            color: Colors.black45,
+            width: double.infinity,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("System Info: $_debugStatusText", style: const TextStyle(color: Colors.grey)),
+                const Divider(),
+                if (_detectedPlayerName.isNotEmpty) ...[
+                  Text("Match Target: $_detectedPlayerName", style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  ..._playerStats.entries.map((entry) => Text("${entry.key}: ${entry.value}")),
+                ] else
+                  const Text("Looking for match telemetry targets...", style: TextStyle(fontStyle: FontStyle.italic)),
+              ],
+            ),
+          )
+        ],
+      ),
+    );
+  }
+}

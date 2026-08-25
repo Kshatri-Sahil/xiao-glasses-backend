@@ -1,0 +1,90 @@
+import os
+import cv2
+import numpy as np
+from flask import Flask, request, jsonify
+import face_recognition
+
+app = Flask(__name__)
+KNOWN_FACES_DIR = "known_players"
+
+# Pre-load and encode your known players database into RAM at startup
+known_face_encodings = []
+known_face_names = []
+
+print("[*] Encoding database profiles using face_recognition engine...")
+for file in os.listdir(KNOWN_FACES_DIR):
+    if file.endswith(('.jpg', '.jpeg', '.png')):
+        path = os.path.join(KNOWN_FACES_DIR, file)
+        
+        # 1. Force load the image via OpenCV to drop alpha/transparency channels safely
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            print(f"[!] Skipping unreadable or corrupted image file: {file}")
+            continue
+            
+        # 2. Explicitly convert the 8-bit BGR frame to standard RGB matrix format
+        rgb_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        try:
+            # 3. Process the safe matrix using dlib
+            encodings = face_recognition.face_encodings(rgb_image)
+            if encodings:
+                known_face_encodings.append(encodings[0])
+                known_face_names.append(os.path.splitext(file)[0].lower())
+                print(f"[+] Successfully indexed profile: {file}")
+            else:
+                print(f"[!] Warning: No human face detected in profile image: {file}")
+        except Exception as face_err:
+            print(f"[!] Error processing face in {file}: {face_err}")
+
+# Mock database tracking player analytics profiles[cite: 2]
+PLAYER_DATABASE = {
+    "sahil": {"Sport": "Pickleball", "DUPR Rating": "4.5 Natively", "Matches Played": "64", "Win Ratio": "78%", "Preferred Shot": "Third Shot Drop"},
+    "jagmeet": {"Sport": "Pickleball", "Skill Level": "Advanced", "Matches Played": "39", "Win Ratio": "68%", "Preferred Shot": "Bandeja"}
+}
+
+@app.route('/api/recognize', methods=['POST'])
+def recognize_face():
+    if not request.data:
+        return jsonify({"face_found": False}), 400
+
+    try:
+        nparr = np.frombuffer(request.data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return jsonify({"face_found": False, "error": "Invalid frame bytes"}), 400
+            
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        face_locations = face_recognition.face_locations(rgb_img)
+        face_encodings = face_recognition.face_encodings(rgb_img, face_locations)
+
+        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+            matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.6)
+            
+            if True in matches:
+                first_match_index = matches.index(True)
+                player_slug = known_face_names[first_match_index]
+                
+                name = player_slug.replace("_", " ").title()
+                stats = PLAYER_DATABASE.get(player_slug, {"Sport": "Racket Sports", "Status": "Guest Profile"})
+
+                return jsonify({
+                    "face_found": True,
+                    "name": name,
+                    "box": {
+                        "left": left,
+                        "top": top,
+                        "width": (right - left),
+                        "height": (bottom - top)
+                    },
+                    "stats": stats
+                })
+
+        return jsonify({"face_found": False})
+    except Exception as e:
+        return jsonify({"face_found": False, "error": str(e)}), 500
+
+if __name__ == '__main__':
+    print("[*] Starting DeepFace Server Engine...")
+    app.run(host='0.0.0.0', port=5000, debug=False)

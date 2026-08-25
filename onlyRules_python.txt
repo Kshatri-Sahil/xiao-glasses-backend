@@ -1,0 +1,191 @@
+import os
+import cv2
+import numpy as np
+import pyttsx3
+import requests
+import io
+import wave
+from flask import Flask, request, jsonify
+from pypdf import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
+import face_recognition
+
+app = Flask(__name__)
+
+# --- CONFIGURATION MATCHING YOUR DIRECTORY ---
+KNOWN_FACES_DIR = "known_players"
+pdf_path = "USAP-Official-Rulebook.pdf" # Matches your screenshot exactly
+
+if not os.path.exists(KNOWN_FACES_DIR):
+    os.makedirs(KNOWN_FACES_DIR)
+
+# --- FEATURE 1: FACE RECOGNITION DATABASE ---
+known_face_encodings = []
+known_face_names = []
+
+print("[*] Encoding database profiles using face_recognition engine...")
+for file in os.listdir(KNOWN_FACES_DIR):
+    if file.endswith(('.jpg', '.jpeg', '.png')):
+        path = os.path.join(KNOWN_FACES_DIR, file)
+        
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+            
+        rgb_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        try:
+            encodings = face_recognition.face_encodings(rgb_image)
+            if encodings:
+                known_face_encodings.append(encodings[0])
+                known_face_names.append(os.path.splitext(file)[0].lower())
+                print(f"[+] Successfully indexed profile: {file}")
+        except Exception as face_err:
+            print(f"[!] Error processing face in {file}: {face_err}")
+
+PLAYER_DATABASE = {
+    "sahil": {"Sport": "Pickleball", "DUPR Rating": "4.5 Natively", "Matches Played": "64", "Win Ratio": "78%", "Preferred Shot": "Third Shot Drop"},
+    "jagmeet": {"Sport": "Pickleball", "Skill Level": "Advanced", "Matches Played": "39", "Win Ratio": "68%", "Preferred Shot": "Bandeja"}
+}
+
+# --- FEATURE 2: OFFLINE RAG TEXT PROCESSING ---
+print("[*] Loading local Whisper Audio Engine on CPU...")
+from faster_whisper import WhisperModel
+asr_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+
+CHUNKS = []
+VECTORIZER = None
+TEXT_MATRIX = None
+
+def index_local_pdf():
+    global CHUNKS, VECTORIZER, TEXT_MATRIX
+    if not os.path.exists(pdf_path):
+        print(f"[!] Target text source '{pdf_path}' missing. Rules engine will run without context.")
+        return
+
+    print("[*] Parsing and chunking rulebook PDF paragraphs natively...")
+    try:
+        reader = PdfReader(pdf_path)
+        raw_text = "".join([page.extract_text() for page in reader.pages if page.extract_text()])
+        
+        lines = raw_text.split('\n')
+        CHUNKS = []
+        current_chunk = ""
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if len(current_chunk) + len(line) < 600:
+                current_chunk += " " + line
+            else:
+                if current_chunk:
+                    CHUNKS.append(current_chunk.strip())
+                current_chunk = line
+        if current_chunk:
+            CHUNKS.append(current_chunk.strip())
+
+        VECTORIZER = TfidfVectorizer(stop_words='english')
+        TEXT_MATRIX = VECTORIZER.fit_transform(CHUNKS)
+        print(f"[+] Local index complete. Generated {len(CHUNKS)} quick-search text segments.")
+    except Exception as e:
+        print(f"[!] Failed to parse PDF file: {e}")
+
+def retrieve_relevant_context(query, top_k=2):
+    if not CHUNKS or VECTORIZER is None:
+        return ""
+    query_vector = VECTORIZER.transform([query])
+    similarity_scores = (TEXT_MATRIX * query_vector.T).toarray().flatten()
+    top_indices = np.argsort(similarity_scores)[-top_k:][::-1]
+    return "\n".join([CHUNKS[i] for i in top_indices])
+
+# --- API ENDPOINTS ---
+@app.route('/api/recognize', methods=['POST'])
+def recognize_face():
+    if not request.data:
+        return jsonify({"face_found": False}), 400
+    try:
+        nparr = np.frombuffer(request.data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return jsonify({"face_found": False, "error": "Invalid frame bytes"}), 400
+            
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(rgb_img)
+        face_encodings = face_recognition.face_encodings(rgb_img, face_locations)
+
+        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+            if not known_face_encodings:
+                continue
+            matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.6)
+            
+            if True in matches:
+                first_match_index = matches.index(True)
+                player_slug = known_face_names[first_match_index]
+                name = player_slug.replace("_", " ").title()
+                stats = PLAYER_DATABASE.get(player_slug, {"Sport": "Racket Sports", "Status": "Guest Profile"})
+
+                return jsonify({
+                    "face_found": True,
+                    "name": name,
+                    "box": {"left": left, "top": top, "width": (right - left), "height": (bottom - top)},
+                    "stats": stats
+                })
+        return jsonify({"face_found": False})
+    except Exception as e:
+        return jsonify({"face_found": False, "error": str(e)}), 500
+
+@app.route('/api/ask_rules', methods=['POST'])
+def ask_rules_offline():
+    if not request.data:
+        return jsonify({"error": "Missing raw audio byte stream"}), 400
+    try:
+        print(f"[*] Received {len(request.data)} bytes of streaming audio from glasses mic...")
+        
+        # Wrap raw I2S PCM bytes arriving from glasses inside a standard WAV configuration header
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wav_file:
+            wav_file.setnchannels(1)      # Mono channel setup
+            wav_file.setsampwidth(2)      # 16-bit encoding
+            wav_file.setframerate(16000)  # Standard 16kHz audio tracking
+            wav_file.writeframes(request.data)
+        wav_buffer.seek(0)
+
+        segments, _ = asr_model.transcribe(wav_buffer, beam_size=1)
+        player_question = "".join([seg.text for seg in segments])
+        print(f"[+] Transcribed Question: '{player_question}'")
+
+        if not player_question.strip():
+            return jsonify({"error": "No clear speech captured"}), 400
+
+        context = retrieve_relevant_context(player_question)
+        prompt = (
+            f"Context from Rulebook:\n{context}\n\n"
+            f"Question: {player_question}\n\n"
+            "Answer the question using only the provided context. Keep your answer under 2 sentences."
+        )
+        
+        ollama_response = requests.post(
+            'http://localhost:11434/api/generate',
+            json={"model": "llama3.2", "prompt": prompt, "stream": False}
+        ).json()
+        
+        answer_text = ollama_response['response']
+        print(f"[+] Local LLM Referee Response: {answer_text}")
+
+        output_wav = "response.wav"
+        engine = pyttsx3.init()
+        engine.save_to_file(answer_text, output_wav)
+        engine.runAndWait()
+
+        with open(output_wav, "rb") as f:
+            audio_bytes = f.read()
+            
+        return audio_bytes, 200, {'Content-Type': 'audio/wav'}
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    index_local_pdf()
+    print("[*] Starting Unified Smart Glasses Server Pipeline...")
+    app.run(host='0.0.0.0', port=5000, debug=False)

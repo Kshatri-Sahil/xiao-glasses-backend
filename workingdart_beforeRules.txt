@@ -1,0 +1,330 @@
+import 'dart:async';
+import 'dart:typed_data';
+import 'dart:convert';
+import 'dart:ui' as ui;
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:http/http.dart' as http;
+import 'package:flutter_mjpeg/flutter_mjpeg.dart';
+import 'package:sound_stream/sound_stream.dart';
+
+void main() => runApp(const MyApp());
+
+class MyApp extends StatelessWidget {
+  const MyApp({Key? key}) : super(key: key);
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'XIAO Smart Glasses',
+      theme: ThemeData.dark().copyWith(
+        primaryColor: Colors.teal,
+        scaffoldBackgroundColor: const Color(0xff121212),
+      ),
+      home: const StreamScreen(),
+    );
+  }
+}
+
+class StreamScreen extends StatefulWidget {
+  const StreamScreen({Key? key}) : super(key: key);
+  @override
+  State<StreamScreen> createState() => _StreamScreenState();
+}
+
+class _StreamScreenState extends State<StreamScreen> {
+  final TextEditingController _ipController = TextEditingController(text: "192.168.1.21");
+  bool _isStreaming = false;
+  bool _isConfiguring = false;
+  String _currentIp = "";
+  
+  final PlayerStream _audioPlayer = PlayerStream();
+  http.Client? _audioClient;
+
+  // Real-time overlay tracking values
+  Timer? _analysisTimer;
+  bool _isAnalyzingFrame = false;
+  String _recognizedPlayerName = "Scanning court...";
+  Map<String, dynamic>? _playerStats;
+  Rect? _detectedFaceBox;
+
+  // Global key to capture screenshots of the running video frame directly from RAM
+  final GlobalKey _videoWidgetKey = GlobalKey();
+  String _debugStatusText = "System initialized. Ready to connect.";
+
+  final Map<String, String> cameraSettings = {
+    'framesize': '9', 'quality': '4', 'brightness': '2', 'contrast': '-1',
+    'saturation': '3', 'sharpness': '2', 'denoise': '5', 'ae_level': '-1',
+    'gainceiling': '128', 'special_effect': '0', 'awb': '1', 'awb_gain': '1',
+    'wb_mode': '0', 'aec': '1', 'aec2': '1', 'agc': '1', 'gma': '1',
+    'lenc': '1', 'hmirror': '1', 'vflip': '1', 'bpc': '1', 'wpc': '1', 'colorbar': '0',
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _audioPlayer.initialize(sampleRate: 16000);
+  }
+
+  Future<void> _applyCameraSettings(String ip) async {
+    setState(() => _isConfiguring = true);
+    try {
+      for (var entry in cameraSettings.entries) {
+        final url = Uri.parse('http://$ip/control?var=${entry.key}&val=${entry.value}');
+        await http.get(url).timeout(const Duration(milliseconds: 500));
+      }
+    } catch (e) {
+      debugPrint('Config push error: $e');
+    } finally {
+      setState(() => _isConfiguring = false);
+    }
+  }
+
+  void _startAudioPipeline(String ip) async {
+    _audioClient = http.Client();
+    final request = http.Request('GET', Uri.parse('http://$ip:82'));
+    try {
+      await _audioPlayer.start();
+      final response = await _audioClient!.send(request);
+      response.stream.listen((List<int> chunk) {
+        if (_isStreaming) _audioPlayer.writeChunk(Uint8List.fromList(chunk));
+      }, onError: (error) => debugPrint("Audio error: $error"), cancelOnError: true);
+    } catch (e) {
+      debugPrint("Audio bind error: $e");
+    }
+  }
+
+  // --- Frame Capture & Recognition Loop ---
+  void _startFaceRecognitionLoop() {
+    _analysisTimer = Timer.periodic(const Duration(milliseconds: 600), (timer) async {
+      if (_isAnalyzingFrame || !_isStreaming) return;
+
+      setState(() {
+        _isAnalyzingFrame = true;
+        _debugStatusText = "Extracting frame from live video widget...";
+      });
+
+      try {
+        final boundary = _videoWidgetKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+        if (boundary == null) throw Exception("Video view container context not active yet.");
+
+        ui.Image image = await boundary.toImage(pixelRatio: 0.5); // Downscale slightly for speed
+        ByteData? byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+        if (byteData == null) throw Exception("Failed to convert image layout to byte streams.");
+        Uint8List frameBytes = byteData.buffer.asUint8List();
+
+        await _queryFaceRecognitionBackend(frameBytes);
+
+      } catch (e) {
+        // Stop the loop temporarily on error so the user can read the problem
+        timer.cancel(); 
+        setState(() {
+          _debugStatusText = "Capture Error: ${e.toString()}";
+        });
+        // Restart the scanning loop automatically after 5 seconds
+        Future.delayed(const Duration(seconds: 5), () {
+          if (_isStreaming) _startFaceRecognitionLoop();
+        });
+      } finally {
+        if (mounted) {
+          setState(() => _isAnalyzingFrame = false);
+        }
+      }
+    });
+  }
+
+  Future<void> _queryFaceRecognitionBackend(Uint8List imageBytes) async {
+    final backendUrl = Uri.parse('http://192.168.1.5:5000/api/recognize');
+    
+    try {
+      setState(() => _debugStatusText = "Sending frame to Python server (192.168.1.5)...");
+      
+      final response = await http.post(
+        backendUrl,
+        headers: {"Content-Type": "image/png"},
+        body: imageBytes,
+      ).timeout(const Duration(seconds: 4));
+
+      if (response.statusCode == 200) {
+        final Map<String, dynamic> data = jsonDecode(utf8.decode(response.bodyBytes));
+        
+        if (data['face_found'] == true) {
+          final box = data['box'];
+          setState(() {
+            _debugStatusText = "Match identified: ${data['name']}";
+            _recognizedPlayerName = data['name'];
+            _detectedFaceBox = Rect.fromLTWH(
+              box['left'].toDouble(), box['top'].toDouble(),
+              box['width'].toDouble(), box['height'].toDouble(),
+            );
+            _playerStats = Map<String, dynamic>.from(data['stats']);
+          });
+        } else {
+          setState(() {
+            _debugStatusText = "Searching court... No matching player profiles seen.";
+            _recognizedPlayerName = "Scanning court...";
+            _detectedFaceBox = null;
+            _playerStats = null;
+          });
+        }
+      } else {
+        setState(() => _debugStatusText = "Backend responded with Server Error: ${response.statusCode}");
+      }
+    } catch (e) {
+      setState(() => _debugStatusText = "Network Error: Cannot connect to Laptop server. Check Wi-Fi.");
+      debugPrint("Backend processing error details: $e");
+    }
+  }
+
+  void _toggleStream() async {
+    if (_isStreaming) {
+      _audioClient?.close();
+      _audioPlayer.stop();
+      _analysisTimer?.cancel();
+      setState(() {
+        _isStreaming = false;
+        _recognizedPlayerName = "Scanning court...";
+        _playerStats = null;
+        _detectedFaceBox = null;
+        _debugStatusText = "Disconnected from system pipeline.";
+      });
+    } else {
+      final ip = _ipController.text.trim();
+      if (ip.isEmpty) return;
+
+      await _applyCameraSettings(ip);
+      _startAudioPipeline(ip);
+      _startFaceRecognitionLoop();
+
+      setState(() {
+        _currentIp = ip;
+        _isStreaming = true;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _audioClient?.close(); _audioPlayer.stop(); _analysisTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('XIAO Sports Analytics Glasses'), backgroundColor: Colors.black, centerTitle: true),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            TextField(
+              controller: _ipController,
+              decoration: const InputDecoration(labelText: 'Smart Glasses IP Address', border: OutlineInputBorder(), prefixIcon: Icon(Icons.videocam)),
+              keyboardType: TextInputType.url,
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton.icon(
+              onPressed: _isConfiguring ? null : _toggleStream,
+              icon: Icon(_isStreaming ? Icons.stop : Icons.sensors),
+              label: Text(_isConfiguring ? 'Syncing Camera Presets...' : (_isStreaming ? 'Disconnect Glasses' : 'Connect Smart Glasses')),
+              style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(50), backgroundColor: _isStreaming ? Colors.redAccent : Colors.teal),
+            ),
+            const SizedBox(height: 8),
+            
+            Text(_debugStatusText, style: TextStyle(color: Colors.grey.shade400, fontSize: 12), textAlign: TextAlign.center),
+            const SizedBox(height: 8),
+            
+            Expanded(
+              flex: 4,
+              child: Center(
+                child: _isStreaming
+                    ? Stack(
+                        children: [
+                          RepaintBoundary(
+                            key: _videoWidgetKey,
+                            child: Container(
+                              decoration: BoxDecoration(border: Border.all(color: Colors.teal.shade700, width: 2), borderRadius: BorderRadius.circular(12)),
+                              clipBehavior: Clip.antiAlias,
+                              child: Mjpeg(isLive: true, stream: 'http://$_currentIp:81/stream', error: (c, e, s) => const Center(child: Text('Video link disconnected.'))),
+                            ),
+                          ),
+                          if (_detectedFaceBox != null)
+                            Positioned.fill(
+                              child: CustomPaint(painter: FaceOverlayPainter(boundingBox: _detectedFaceBox!, name: _recognizedPlayerName)),
+                            ),
+                        ],
+                      )
+                    : const Text('Glasses Status: Offline'),
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            Expanded(
+              flex: 3,
+              child: Container(
+                width: double.infinity, padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(color: Colors.grey.shade900, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.grey.shade800)),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.face, color: Colors.tealAccent),
+                        const SizedBox(width: 8),
+                        Text(_recognizedPlayerName, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.tealAccent)),
+                        const Spacer(),
+                        if (_isAnalyzingFrame) const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.tealAccent)),
+                      ],
+                    ),
+                    const Divider(height: 20, color: Colors.grey),
+                    if (_playerStats != null)
+                      Expanded(
+                        child: ListView(
+                          children: _playerStats!.entries.map((entry) {
+                            return Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 4.0),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Text(entry.key, style: TextStyle(color: Colors.grey.shade400)),
+                                  Text(entry.value.toString(), style: const TextStyle(fontWeight: FontWeight.w500)),
+                                ],
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      )
+                    else
+                      const Expanded(child: Center(child: Text("Look at a player to pull match analytics telemetry.", style: TextStyle(color: Colors.grey)))),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class FaceOverlayPainter extends CustomPainter {
+  final Rect boundingBox;
+  final String name;
+  FaceOverlayPainter({required this.boundingBox, required this.name});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = Colors.red..style = PaintingStyle.stroke..strokeWidth = 3.0;
+    canvas.drawRect(boundingBox, paint);
+
+    final textPainter = TextPainter(
+      text: TextSpan(text: ' $name ', style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold, backgroundColor: Colors.red)),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    textPainter.paint(canvas, Offset(boundingBox.left, boundingBox.top - 20));
+  }
+
+  @override
+  bool shouldRepaint(FaceOverlayPainter oldDelegate) {
+    return oldDelegate.boundingBox != boundingBox || oldDelegate.name != name;
+  }
+}
