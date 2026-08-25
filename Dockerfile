@@ -23,5 +23,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy assets and app code
 COPY . .
 
-# Bind Gunicorn to both $PORT, 10000, and 5000 to guarantee connection on Render
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-10000} --bind 0.0.0.0:5000 --bind 0.0.0.0:10000 --workers 1 --threads 4 --timeout 300 app:app"]
+# Bind Gunicorn to dynamic Render $PORT (single bind to avoid duplicate port conflict)
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-10000} --workers 1 --threads 4 --timeout 300 app:app"]
