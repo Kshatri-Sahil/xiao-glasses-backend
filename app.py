@@ -58,10 +58,17 @@ PLAYER_DATABASE = {
 }
 
 # --- FEATURE 2: OFFLINE RAG TEXT PROCESSING ---
-print("[*] Loading local Whisper Audio Engine on CPU...")
-from faster_whisper import WhisperModel
+asr_model = None
 
-asr_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+
+def get_asr_model():
+    global asr_model
+    if asr_model is None:
+        print("[*] Loading local Whisper Audio Engine on CPU...")
+        from faster_whisper import WhisperModel
+        asr_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    return asr_model
+
 
 CHUNKS = []
 VECTORIZER = None
@@ -185,7 +192,8 @@ def ask_rules_offline():
             wav_file.writeframes(request.data)
         wav_buffer.seek(0)
 
-        segments, _ = asr_model.transcribe(wav_buffer, beam_size=1)
+        model = get_asr_model()
+        segments, _ = model.transcribe(wav_buffer, beam_size=1)
         player_question = "".join([seg.text for seg in segments])
         print(f"[+] Transcribed Question: '{player_question}'")
 
