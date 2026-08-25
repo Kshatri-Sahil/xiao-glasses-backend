@@ -12,8 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install pre-compiled binary dlib and face-recognition
-RUN pip install --no-cache-dir dlib-bin face-recognition-models && \
+# Install pre-compiled binary dlib, Pillow, and face-recognition
+RUN pip install --no-cache-dir dlib-bin face-recognition-models Pillow && \
     pip install --no-cache-dir --no-deps face-recognition
 
 # Install rest of requirements

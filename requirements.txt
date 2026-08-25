@@ -8,3 +8,4 @@ scikit-learn==1.4.2
 gTTS==2.5.1
 pydub==0.25.1
 faster-whisper==1.0.3
+Pillow==10.3.0
