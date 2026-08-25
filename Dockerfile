@@ -1,24 +1,27 @@
 FROM python:3.11-slim
 
-# Install runtime system dependencies (ffmpeg for audio, libgl for opencv)
+# Install system dependencies for OpenCV, FFmpeg, and audio
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
     libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install pre-compiled binary dlib and face-recognition without compiling from source
+# Install pre-compiled binary dlib and face-recognition
 RUN pip install --no-cache-dir dlib-bin face-recognition-models && \
     pip install --no-cache-dir --no-deps face-recognition
 
-# Install other requirements
+# Install rest of requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
+# Copy assets and app code
 COPY . .
 
-# Start gunicorn binding to dynamic Render $PORT (defaults to 10000)
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-10000} --workers 1 --threads 4 --timeout 300 app:app"]
+# Bind Gunicorn to both $PORT, 10000, and 5000 to guarantee connection on Render
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-10000} --bind 0.0.0.0:5000 --bind 0.0.0.0:10000 --workers 1 --threads 4 --timeout 300 app:app"]
