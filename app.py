@@ -176,6 +176,64 @@ def recognize_face():
         return jsonify({"face_found": False, "error": str(e)}), 500
 
 
+@app.route("/api/players", methods=["GET"])
+def get_players():
+    return jsonify({
+        "players": list(PLAYER_DATABASE.keys()),
+        "database": PLAYER_DATABASE,
+        "indexed_faces": known_face_names
+    }), 200
+
+
+@app.route("/api/register_player", methods=["POST"])
+def register_player():
+    """
+    Accepts multipart/form-data with 'name', 'image', and optional stats.
+    Encodes the new face dynamically into RAM and saves to disk with zero server reboot!
+    """
+    try:
+        if "image" in request.files and "name" in request.form:
+            name = request.form["name"].strip().lower().replace(" ", "_")
+            file = request.files["image"]
+            img_bytes = file.read()
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                return jsonify({"error": "Invalid image format"}), 400
+            
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            encodings = face_recognition.face_encodings(rgb_img)
+            if not encodings:
+                return jsonify({"error": "No face found in uploaded photo"}), 400
+            
+            save_path = os.path.join(KNOWN_FACES_DIR, f"{name}.jpg")
+            with open(save_path, "wb") as f:
+                f.write(img_bytes)
+                
+            known_face_encodings.append(encodings[0])
+            known_face_names.append(name)
+            
+            stats = {
+                "Sport": request.form.get("sport", "Pickleball"),
+                "Skill Level": request.form.get("skill_level", "Intermediate"),
+                "Matches Played": request.form.get("matches", "1"),
+                "Win Ratio": request.form.get("win_ratio", "50%"),
+                "Preferred Shot": request.form.get("preferred_shot", "Serve")
+            }
+            PLAYER_DATABASE[name] = stats
+            
+            return jsonify({
+                "status": "success",
+                "message": f"Player '{name.replace('_', ' ').title()}' successfully registered in Cloud AI!",
+                "stats": stats
+            }), 200
+        else:
+            return jsonify({"error": "Missing 'name' or 'image' file in request"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
 @app.route("/api/ask_rules", methods=["POST"])
 def ask_rules_offline():
     if not request.data:
