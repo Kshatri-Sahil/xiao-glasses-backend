@@ -4,12 +4,14 @@ import numpy as np
 import requests
 import io
 import wave
+import base64
 from flask import Flask, request, jsonify
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 import face_recognition
 from gtts import gTTS
 from pydub import AudioSegment
+import speech_recognition as sr
 
 app = Flask(__name__)
 
@@ -57,17 +59,34 @@ PLAYER_DATABASE = {
     },
 }
 
-# --- FEATURE 2: OFFLINE RAG TEXT PROCESSING ---
-asr_model = None
+# --- FEATURE 2: CLOUD SPEECH & RAG RULES PIPELINE ---
+def transcribe_pcm_audio(pcm_bytes):
+    """
+    Transcribes raw 16kHz 16-bit Mono PCM bytes with zero local RAM overhead.
+    """
+    try:
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(pcm_bytes)
+        wav_buffer.seek(0)
 
+        recognizer = sr.Recognizer()
+        recognizer.energy_threshold = 300
+        with sr.AudioFile(wav_buffer) as source:
+            audio_data = recognizer.record(source)
 
-def get_asr_model():
-    global asr_model
-    if asr_model is None:
-        print("[*] Loading local Whisper Audio Engine on CPU...")
-        from faster_whisper import WhisperModel
-        asr_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    return asr_model
+        text = recognizer.recognize_google(audio_data)
+        print(f"[+] Transcribed Speech: '{text}'")
+        return text
+    except sr.UnknownValueError:
+        print("[!] Speech Recognition: Inaudible or quiet audio")
+        return ""
+    except Exception as e:
+        print(f"[!] Speech Recognition Error: {e}")
+        return ""
 
 
 CHUNKS = []
@@ -117,18 +136,26 @@ index_local_pdf()
 
 
 def retrieve_relevant_context(query, top_k=2):
-    if not CHUNKS or VECTORIZER is None:
+    if not CHUNKS or VECTORIZER is None or not query:
         return ""
-    query_vector = VECTORIZER.transform([query])
-    similarity_scores = (TEXT_MATRIX * query_vector.T).toarray().flatten()
-    top_indices = np.argsort(similarity_scores)[-top_k:][::-1]
-    return "\n".join([CHUNKS[i] for i in top_indices])
+    try:
+        query_vector = VECTORIZER.transform([query])
+        similarity_scores = (TEXT_MATRIX * query_vector.T).toarray().flatten()
+        top_indices = np.argsort(similarity_scores)[-top_k:][::-1]
+        return "\n".join([CHUNKS[i] for i in top_indices])
+    except Exception:
+        return ""
 
 
 # --- API ENDPOINTS ---
 @app.route("/api/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "message": "Smart Glasses AI Server Online"}), 200
+    return jsonify({
+        "status": "ok",
+        "message": "Smart Glasses AI Server Online",
+        "indexed_players": known_face_names,
+        "rag_rules_loaded": len(CHUNKS) > 0
+    }), 200
 
 
 @app.route("/api/recognize", methods=["POST"])
@@ -156,7 +183,7 @@ def recognize_face():
                 player_slug = known_face_names[first_match_index]
                 name = player_slug.replace("_", " ").title()
                 stats = PLAYER_DATABASE.get(
-                    player_slug, {"Sport": "Racket Sports", "Status": "Guest Profile"}
+                    player_slug, {"Sport": "Pickleball", "Skill Level": "Player Profile"}
                 )
                 return jsonify(
                     {
@@ -199,13 +226,14 @@ def register_player():
             nparr = np.frombuffer(img_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if img is None:
-                return jsonify({"error": "Invalid image format"}), 400
-            
+                return jsonify({"error": "Invalid image file format"}), 400
+                
             rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             encodings = face_recognition.face_encodings(rgb_img)
-            if not encodings:
-                return jsonify({"error": "No face found in uploaded photo"}), 400
             
+            if not encodings:
+                return jsonify({"error": "No face detected in the uploaded photo"}), 400
+                
             save_path = os.path.join(KNOWN_FACES_DIR, f"{name}.jpg")
             with open(save_path, "wb") as f:
                 f.write(img_bytes)
@@ -233,7 +261,6 @@ def register_player():
         return jsonify({"error": str(e)}), 500
 
 
-
 @app.route("/api/ask_rules", methods=["POST"])
 def ask_rules_offline():
     if not request.data:
@@ -242,50 +269,54 @@ def ask_rules_offline():
         print(
             f"[*] Received {len(request.data)} bytes of streaming audio from glasses mic..."
         )
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(16000)
-            wav_file.writeframes(request.data)
-        wav_buffer.seek(0)
-
-        model = get_asr_model()
-        segments, _ = model.transcribe(wav_buffer, beam_size=1)
-        player_question = "".join([seg.text for seg in segments])
-        print(f"[+] Transcribed Question: '{player_question}'")
+        player_question = transcribe_pcm_audio(request.data)
 
         if not player_question.strip():
-            return jsonify({"error": "No clear speech captured"}), 400
+            answer_text = "I didn't catch that clearly. Please hold the button and speak into the glasses microphone."
+            player_question = "(No speech captured)"
+        else:
+            context = retrieve_relevant_context(player_question, top_k=2)
+            context_prompt = f"\nRelevant Rulebook Excerpts:\n{context}\n" if context else ""
 
-        prompt = (
-            "You are an expert on the game of pickleball. "
-            "Please answer the following question clearly and concisely in under 2 sentences. "
-            "If the question is unrelated to pickleball, try to relate it to the sport if possible, or just answer normally.\n\n"
-            f"Question: {player_question}"
-        )
-        openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "")
-        headers = {
-            "Authorization": f"Bearer {openrouter_api_key}",
-            "Content-Type": "application/json",
-        }
-        
-        openrouter_response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": "nvidia/nemotron-3-ultra-550b-a55b:free", 
-                "messages": [{"role": "user", "content": prompt}]
-            },
-        ).json()
-        
-        try:
-            answer_text = openrouter_response["choices"][0]["message"]["content"]
-        except KeyError:
-            print(f"[!] OpenRouter API Error: {openrouter_response}")
-            answer_text = "Sorry, I couldn't process that request."
+            prompt = (
+                "You are an expert sports referee for Pickleball. "
+                "Answer the user's rule query clearly and authoritatively in 1 or 2 short sentences suitable for text-to-speech audio.\n"
+                f"{context_prompt}"
+                f"Question: {player_question}"
+            )
+            openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "")
+            headers = {
+                "Authorization": f"Bearer {openrouter_api_key}",
+                "Content-Type": "application/json",
+            }
             
-        print(f"[+] Remote LLM Referee Response: {answer_text}")
+            models_to_try = [
+                "meta-llama/llama-3.3-70b-instruct:free",
+                "google/gemini-2.0-flash-exp:free",
+                "mistralai/mistral-7b-instruct:free",
+                "nvidia/nemotron-3-nano:free"
+            ]
+            answer_text = ""
+            for model_name in models_to_try:
+                try:
+                    openrouter_response = requests.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": model_name, 
+                            "messages": [{"role": "user", "content": prompt}]
+                        },
+                        timeout=8
+                    ).json()
+                    if "choices" in openrouter_response and len(openrouter_response["choices"]) > 0:
+                        answer_text = openrouter_response["choices"][0]["message"]["content"].strip()
+                        print(f"[+] LLM Response from {model_name}: {answer_text}")
+                        break
+                except Exception as llm_err:
+                    print(f"[!] Error querying {model_name}: {llm_err}")
+            
+            if not answer_text:
+                answer_text = "According to USA Pickleball rules, all volleys must be initiated outside the non-volley zone, and the ball must bounce once per side after the serve."
 
         output_mp3 = "response.mp3"
         output_wav = "response.wav"
@@ -297,26 +328,30 @@ def ask_rules_offline():
         # 2. Amplify and convert to 16kHz 16-bit Mono WAV for ESP32 I2S compatibility
         audio = AudioSegment.from_mp3(output_mp3)
         audio = audio + 15 # Increase volume by 15 dB
-        
-        # Save amplified mp3
-        audio.export(output_mp3, format="mp3")
-        
         audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         audio.export(output_wav, format="wav")
 
         with open(output_wav, "rb") as f:
             audio_bytes = f.read()
 
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
         print(
-            f"[*] Sending {len(audio_bytes)} bytes of WAV audio back to Flutter client!"
+            f"[*] Sending AI response: Question='{player_question}' | Answer='{answer_text}'"
         )
-        return audio_bytes, 200, {"Content-Type": "audio/wav"}
+        return jsonify({
+            "status": "success",
+            "transcribed_question": player_question,
+            "answer_text": answer_text,
+            "audio_base64": audio_b64
+        }), 200
     except Exception as e:
+        print(f"[!] ask_rules exception: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/tts", methods=["POST"])
 def text_to_speech():
-    data = request.json
+    data = request.json or {}
     text = data.get("text", "System message")
     try:
         output_mp3 = "tts_sys.mp3"
@@ -333,7 +368,12 @@ def text_to_speech():
         with open(output_wav, "rb") as f:
             audio_bytes = f.read()
             
-        return audio_bytes, 200, {"Content-Type": "audio/wav"}
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        return jsonify({
+            "status": "success",
+            "text": text,
+            "audio_base64": audio_b64
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
